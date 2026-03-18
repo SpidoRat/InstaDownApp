@@ -9,6 +9,8 @@ Dependencies:
 """
 
 import os
+import time
+import random
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -20,13 +22,19 @@ import instaloader
 # Core Download Logic
 # ─────────────────────────────────────────────
 
-def download_posts(loader: instaloader.Instaloader, profile: instaloader.Profile, max_posts: int, progress_callback=None) -> int:
+def download_posts(loader, profile, max_posts, progress_callback=None):
     """
     Downloads up to `max_posts` image-only posts from the given Instagram profile.
 
     Skips:
         - Videos (post.is_video)
         - Carousels/Sidecars (GraphSidecar) that may include videos
+
+    Rate Limit Handling:
+        - A random 4–8 second delay is added between each post download to
+          mimic human browsing and reduce HTTP 429 (Too Many Requests) errors.
+        - If a 429 is still received, the script waits 30 minutes and retries
+          up to MAX_RETRIES times before aborting.
 
     Args:
         loader:            Authenticated (or anonymous) Instaloader instance.
@@ -39,6 +47,7 @@ def download_posts(loader: instaloader.Instaloader, profile: instaloader.Profile
     """
     os.makedirs(profile.username, exist_ok=True)
     downloaded_count = 0
+    MAX_RETRIES = 3
 
     for post in profile.get_posts():
         if downloaded_count >= max_posts:
@@ -48,17 +57,35 @@ def download_posts(loader: instaloader.Instaloader, profile: instaloader.Profile
         if post.is_video or post.typename == "GraphSidecar":
             continue
 
-        loader.download_post(post, target=profile.username)
-        downloaded_count += 1
+        # Retry loop — handles transient 429 rate-limit responses
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                loader.download_post(post, target=profile.username)
+                downloaded_count += 1
 
-        # Notify UI of progress if a callback is provided
-        if progress_callback:
-            progress_callback(downloaded_count, max_posts)
+                # Notify UI of progress if a callback is provided
+                if progress_callback:
+                    progress_callback(downloaded_count, max_posts)
+
+                # ── Polite delay between posts ──────────────────────────
+                # Random sleep (4–8 s) mimics human browsing and reduces
+                # the chance of triggering Instagram's rate limiter (429).
+                time.sleep(random.uniform(4, 8))
+                break  # Success — exit the retry loop
+
+            except instaloader.exceptions.TooManyRequestsException:
+                if attempt < MAX_RETRIES:
+                    wait_minutes = 30
+                    print(f"[Rate Limit] HTTP 429 received. Waiting {wait_minutes} min before retry {attempt}/{MAX_RETRIES}...")
+                    time.sleep(wait_minutes * 60)  # Wait 30 minutes then retry
+                else:
+                    print("[Rate Limit] Max retries reached. Aborting.")
+                    raise  # Re-raise so the worker surfaces it to the user
 
     return downloaded_count
 
 
-def remove_unwanted_files(folder_path: str) -> None:
+def remove_unwanted_files(folder_path):
     """
     Cleans up metadata and archive files left by instaloader after downloading.
 
@@ -88,9 +115,12 @@ def remove_unwanted_files(folder_path: str) -> None:
 # Login Helper
 # ─────────────────────────────────────────────
 
-def attempt_login(loader: instaloader.Instaloader, username: str, password: str) -> bool:
+def attempt_login(loader, username, password):
     """
     Attempts to log in to Instagram using the provided credentials.
+
+    Logging in is strongly recommended to avoid HTTP 429 rate limiting,
+    as anonymous requests are throttled more aggressively by Instagram.
 
     Args:
         loader:   Instaloader instance to authenticate.
@@ -127,12 +157,15 @@ def attempt_login(loader: instaloader.Instaloader, username: str, password: str)
 # GUI Callbacks
 # ─────────────────────────────────────────────
 
-def run_download() -> None:
+def run_download():
     """
     Entry point triggered by the Download button.
 
     Validates all input fields, optionally logs in, then spawns a background
     thread to perform the download — keeping the UI responsive throughout.
+
+    TIP: Logging in (even with your own account) significantly reduces 429 errors
+    because authenticated sessions get a much higher request quota from Instagram.
     """
     target_profile = profile_entry.get().strip()
     max_posts_str  = max_posts_entry.get().strip()
@@ -157,13 +190,24 @@ def run_download() -> None:
         password = password_entry.get().strip()
         if not attempt_login(loader, username, password):
             return  # Abort if login failed
+    else:
+        # Warn the user that anonymous mode is more likely to hit rate limits
+        proceed = messagebox.askyesno(
+            "Anonymous Mode Warning",
+            "Without logging in, Instagram may rate-limit your requests (HTTP 429).\n\n"
+            "It is recommended to log in for reliable downloads.\n\n"
+            "Continue without logging in?"
+        )
+        if not proceed:
+            return
 
     # ── Lock UI during download ───────────────
     set_ui_state(disabled=True)
-    status_label.config(text="Starting download…")
+    status_label.config(text="Starting download...")
     progress_bar["value"] = 0
 
     # ── Run download in background thread ─────
+    # Threading prevents the GUI from freezing during long waits (e.g. 30-min 429 hold-off)
     thread = threading.Thread(
         target=_download_worker,
         args=(loader, target_profile, max_posts),
@@ -172,21 +216,21 @@ def run_download() -> None:
     thread.start()
 
 
-def _download_worker(loader: instaloader.Instaloader, target_profile: str, max_posts: int) -> None:
+def _download_worker(loader, target_profile, max_posts):
     """
     Background worker that performs the actual download.
-    Calls back to the main thread to update UI via `app.after()`.
+    Calls back to the main thread to update UI via app.after() for thread safety.
 
     Args:
         loader:         Authenticated (or anonymous) Instaloader instance.
         target_profile: Username of the profile to download from.
         max_posts:      Maximum number of image posts to download.
     """
-    def update_progress(current: int, total: int) -> None:
-        """Thread-safe UI progress update."""
+    def update_progress(current, total):
+        """Thread-safe UI progress update via app.after()."""
         percent = int((current / total) * 100)
         app.after(0, lambda: progress_bar.config(value=percent))
-        app.after(0, lambda: status_label.config(text=f"Downloaded {current} / {total} posts…"))
+        app.after(0, lambda: status_label.config(text=f"Downloaded {current} / {total} posts..."))
 
     try:
         profile = instaloader.Profile.from_username(loader.context, target_profile)
@@ -196,6 +240,17 @@ def _download_worker(loader: instaloader.Instaloader, target_profile: str, max_p
         # ── Success ───────────────────────────
         app.after(0, lambda: _on_download_complete(target_profile, downloaded))
 
+    except instaloader.exceptions.TooManyRequestsException:
+        # Raised only when all retries inside download_posts are exhausted
+        app.after(0, lambda: messagebox.showerror(
+            "Rate Limited (HTTP 429)",
+            "Instagram blocked the requests after multiple retries.\n\n"
+            "Tips to avoid this:\n"
+            "  • Log in with your Instagram account\n"
+            "  • Wait 30–60 minutes before retrying\n"
+            "  • Close the Instagram app on your phone\n"
+            "  • Reduce the number of posts per session"
+        ))
     except instaloader.exceptions.ProfileNotExistsException:
         app.after(0, lambda: messagebox.showerror(
             "Profile Not Found", f"No Instagram profile found for '{target_profile}'."
@@ -226,7 +281,7 @@ def _download_worker(loader: instaloader.Instaloader, target_profile: str, max_p
         app.after(0, lambda: status_label.config(text="Ready"))
 
 
-def _on_download_complete(profile_name: str, count: int) -> None:
+def _on_download_complete(profile_name, count):
     """
     Called on the main thread after a successful download.
 
@@ -242,7 +297,7 @@ def _on_download_complete(profile_name: str, count: int) -> None:
     )
 
 
-def clear_fields() -> None:
+def clear_fields():
     """
     Resets all input fields and UI state back to defaults.
     Called by the Clear button.
@@ -257,7 +312,7 @@ def clear_fields() -> None:
     toggle_credentials()  # Hide credential fields
 
 
-def set_ui_state(disabled: bool) -> None:
+def set_ui_state(disabled):
     """
     Enables or disables interactive widgets during a download to prevent re-entry.
 
@@ -274,10 +329,10 @@ def set_ui_state(disabled: bool) -> None:
         widget.config(state=state)
 
 
-def toggle_credentials(*_) -> None:
+def toggle_credentials(*_):
     """
     Shows or hides the username/password fields based on the login radio selection.
-    Bound to changes on `login_var`.
+    Bound to changes on login_var via trace_add.
     """
     if login_var.get() == "yes":
         credentials_frame.grid()
@@ -308,7 +363,7 @@ tk.Label(app, text="Login Required?").grid(row=2, column=0, sticky="e", padx=6, 
 login_var = tk.StringVar(value="no")
 login_var.trace_add("write", toggle_credentials)  # Dynamically show/hide credentials
 
-login_yes_radio = tk.Radiobutton(app, text="Yes", variable=login_var, value="yes")
+login_yes_radio = tk.Radiobutton(app, text="Yes (Recommended)", variable=login_var, value="yes")
 login_yes_radio.grid(row=2, column=1, sticky="w")
 
 login_no_radio = tk.Radiobutton(app, text="No", variable=login_var, value="no")
